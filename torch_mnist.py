@@ -26,6 +26,7 @@ test_dataloader = DataLoader(test_data, batch_size=16, shuffle=True)
 epochs = 1000
 m = MLP()
 optim = adam.Adam(m.parameters(), lr=3e-4)
+loss = None
 for i in range(epochs):
     data, labels = next(iter(train_dataloader))
     pred = m(data)
@@ -42,3 +43,10 @@ for i in range(epochs):
             correct = (predicted == labels).sum().item()  # Count correct predictions
             accuracy = correct / labels.size(0)  # Compute accuracy as a fraction of total samples
         print(f"loss: {loss}, accuracy: {accuracy}")
+
+torch.save({
+    'epoch': epochs,
+    'model_state_dict': m.state_dict(),
+    'optimizer_state_dict': optim.state_dict(),
+    'loss': loss
+}, "./pretrained/mnist.pt")
