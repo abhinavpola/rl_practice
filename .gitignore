@@ -1,2 +1,4 @@
 .conda_env
 .DS_Store
+*.pkl
+*.safetensors
