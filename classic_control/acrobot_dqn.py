@@ -6,10 +6,8 @@ import numpy as np
 from typeguard import typechecked
 import os
 from tinygrad.nn.state import safe_save, safe_load, get_state_dict, load_state_dict
-from tqdm import tqdm
-import itertools
-import pickle
-from datetime import datetime
+from logger import Logger
+
 
 class MSELoss:
     """
@@ -80,7 +78,8 @@ class DQN:
     def __init__(self, hidden_size=128):
         self.l1 = nn.Linear(6, hidden_size)
         self.l2 = nn.Linear(hidden_size, hidden_size)
-        self.l3 = nn.Linear(hidden_size, 3)
+        self.l3 = nn.Linear(hidden_size, 256)
+        self.l4 = nn.Linear(256, 3)
 
     @typechecked
     def __call__(self, x: Tensor) -> Tensor:
@@ -90,12 +89,19 @@ class DQN:
         """
         x = self.l1(x).leaky_relu()
         x = self.l2(x).leaky_relu()
-        return self.l3(x)
+        x = self.l3(x).leaky_relu()
+        return self.l4(x)
 
 
 class Agent:
-    def __init__(self, learning_rate=0.001, epsilon_decay=500, hidden_size=128, 
-                 gamma=0.99, sync_interval=1000):
+    def __init__(
+        self,
+        learning_rate=0.001,
+        epsilon_decay=500,
+        hidden_size=128,
+        gamma=0.99,
+        sync_interval=1000,
+    ):
         self.dqn = DQN(hidden_size=hidden_size)
         self.target_dqn = DQN(hidden_size=hidden_size)
         load_state_dict(self.target_dqn, get_state_dict(self.dqn))
@@ -112,6 +118,7 @@ class Agent:
         self.steps_done = 0
         self.sync_interval = sync_interval
         self.model_path = "acrobot_dqn_model.safetensors"
+        self.logger = Logger()
 
     @typechecked
     def select_action(self, state: Tensor) -> int:
@@ -121,6 +128,9 @@ class Agent:
             -1.0 * self.steps_done / self.epsilon_decay
         )
 
+        # Log epsilon
+        self.logger.log_step(epsilon=eps)
+
         self.steps_done += 1
         if random.random() < eps:
             return random.randint(0, 2)  # 0, 1, or 2
@@ -128,6 +138,9 @@ class Agent:
             Tensor.training = False
             q_values = self.dqn(state)
             Tensor.training = True
+
+            # Log Q-values
+            self.logger.log_step(q_value=float(q_values.max().numpy()))
 
             return int(q_values.argmax().numpy())
 
@@ -155,8 +168,24 @@ class Agent:
 
         # Compute loss
         loss = self.loss(current_q_values, target_q.squeeze())
+
         self.optim.zero_grad()
         loss.backward()
+
+        # Calculate gradient norm
+        grad_norm = 0.0
+        for p in nn.state.get_parameters(self.dqn):
+            if p.grad is not None:
+                grad_norm += float((p.grad**2).sum().numpy())
+        grad_norm = np.sqrt(grad_norm)
+
+        # Log metrics
+        self.logger.log_step(
+            loss=float(loss.numpy()),
+            grad_norm=grad_norm,
+            future_reward=float(next_q_max.mean().numpy()),
+        )
+
         self.optim.step()
 
     def sync_target(self):
@@ -198,139 +227,112 @@ class Agent:
 def train_and_evaluate(hyperparams, num_eval_episodes=5):
     # Create agent with specified hyperparameters
     agent = Agent(
-        learning_rate=hyperparams['learning_rate'],
-        epsilon_decay=hyperparams['epsilon_decay'],
-        hidden_size=hyperparams['hidden_size'],
-        gamma=hyperparams['gamma'],
-        sync_interval=hyperparams['sync_interval']
+        learning_rate=hyperparams["learning_rate"],
+        epsilon_decay=hyperparams["epsilon_decay"],
+        hidden_size=hyperparams["hidden_size"],
+        gamma=hyperparams["gamma"],
+        sync_interval=hyperparams["sync_interval"],
     )
-    
+
     # Training environment
     training_env = gym.make("Acrobot-v1")
-    
+
     # Training loop
     total_steps = 0
     num_episodes = 200  # Reduced for grid search
     max_steps = 200
-    
+
     with Tensor.train():
         for ep in range(1, num_episodes + 1):
             state, info = training_env.reset()
             state_t = Tensor(state)
             episode_reward = 0
-            
+
             for t in range(max_steps):
                 action = agent.select_action(state_t)
-                next_state, reward, terminated, truncated, info = training_env.step(action)
+                next_state, reward, terminated, truncated, info = training_env.step(
+                    action
+                )
                 next_state_t = Tensor(next_state)
                 agent.replay_buffer.push(state, action, reward, next_state, terminated)
                 agent.update()
-                
+
+                # Log reward
+                agent.logger.log_step(reward=reward)
+
                 episode_reward += reward
                 state = next_state
                 state_t = next_state_t
                 total_steps += 1
-                
+
                 if total_steps % agent.sync_interval == 0:
                     agent.sync_target()
-                
+
                 if terminated or truncated:
                     break
-            
+
+            # End episode in logger
+            agent.logger.end_episode()
+
             if ep % 50 == 0:
                 print(f"Episode {ep} finished with reward {episode_reward}")
-    
+
+    # Save and plot metrics
+    agent.logger.save_metrics()
+    agent.logger.plot_metrics()
+
     # Evaluate the trained agent
     eval_env = gym.make("Acrobot-v1")
     eval_rewards = []
-    
+
     for _ in range(num_eval_episodes):
         state, info = eval_env.reset()
         state_t = Tensor(state)
         episode_reward = 0
         done = False
-        
+
         while not done:
             Tensor.training = False
             q_values = agent.dqn(state_t)
             action = int(q_values.argmax().numpy())
-            
+
             next_state, reward, terminated, truncated, info = eval_env.step(action)
             state_t = Tensor(next_state)
             episode_reward += reward
             done = terminated or truncated
-        
+
         eval_rewards.append(episode_reward)
-    
+
     avg_reward = sum(eval_rewards) / len(eval_rewards)
     return avg_reward, agent
 
 
 if __name__ == "__main__":
-    # Define hyperparameter grid
-    param_grid = {
-        'learning_rate': [0.0005, 0.001, 0.002],
-        'epsilon_decay': [300, 500, 700],
-        'hidden_size': [64, 128, 256],
-        'gamma': [0.97, 0.99],
-        'sync_interval': [500, 1000]
+    # Define hyperparameters
+    hyperparams = {
+        "learning_rate": 1e-4,
+        "epsilon_decay": 1e-4,
+        "hidden_size": 128,
+        "gamma": 0.99,
+        "sync_interval": 1000,
     }
-    
-    # Generate all combinations
-    keys = param_grid.keys()
-    hyperparam_combinations = [dict(zip(keys, combo)) 
-                             for combo in itertools.product(*param_grid.values())]
-    
-    print(f"Running grid search with {len(hyperparam_combinations)} combinations")
-    
-    results = []
-    best_reward = float('-inf')
-    best_hyperparams = None
-    best_agent = None
-    
-    # Create timestamp for saving results
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    
-    for i, hyperparams in enumerate(hyperparam_combinations):
-        print(f"\nCombination {i+1}/{len(hyperparam_combinations)}")
-        print(f"Hyperparameters: {hyperparams}")
-        
-        # Train and evaluate with these hyperparameters
-        avg_reward, agent = train_and_evaluate(hyperparams)
-        
-        results.append({
-            'hyperparams': hyperparams,
-            'avg_reward': avg_reward
-        })
-        
-        print(f"Average evaluation reward: {avg_reward}")
-        
-        # Check if this is the best so far
-        if avg_reward > best_reward:
-            best_reward = avg_reward
-            best_hyperparams = hyperparams
-            best_agent = agent
-            
-            # Save intermediate best model
-            best_agent.save_model()
-            
-        # Save all results after each combination
-        with open(f"grid_search_results_{timestamp}.pkl", "wb") as f:
-            pickle.dump(results, f)
-    
-    print("\nGrid Search Complete!")
-    print(f"Best hyperparameters: {best_hyperparams}")
-    print(f"Best average reward: {best_reward}")
-    
-    # Save the best agent separately
-    model_path = f"best_acrobot_dqn_{timestamp}.safetensors"
-    state_dict = get_state_dict(best_agent.dqn)
+
+    print(f"Training with hyperparameters: {hyperparams}")
+
+    # Train and evaluate with these hyperparameters
+    avg_reward, agent = train_and_evaluate(hyperparams)
+
+    print(f"Average evaluation reward: {avg_reward}")
+
+    # Save the model
+    model_path = "acrobot_dqn_model.safetensors"
+    state_dict = get_state_dict(agent.dqn)
     safe_save(state_dict, model_path)
-    print(f"Best model saved to {model_path}")
-    
-    # Play a demo game with the best agent
-    print("\nPlaying a game with the best agent:")
+    print(f"Model saved to {model_path}")
+
+    # Play a demo game with the trained agent
+    print("\nPlaying a game with the trained agent:")
     demo_env = gym.make("Acrobot-v1", render_mode="human")
-    reward = best_agent.play_game(demo_env)
+    reward = agent.play_game(demo_env)
     print(f"Game finished with reward {reward}")
     demo_env.close()
